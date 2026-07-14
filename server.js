@@ -486,7 +486,7 @@ function readRequestBody(req, callback) {
       const parsed = JSON.parse(body);
       callback(null, parsed);
     } catch (err) {
-      callback(new Error("Invalid JSON body"));
+      callback(new Error("Invalid JSON body"));g
     }
   });
 }
