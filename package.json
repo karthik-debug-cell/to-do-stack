@@ -1,0 +1,24 @@
+{
+  "name": "smart-event-driven-todo-manager",
+  "version": "1.0.0",
+  "description": "A Smart Event-Driven TO-DO List Web Application built with pure Node.js (http, events, fs) for a Node.js Laboratory Practical. No Express, no database, no external frameworks.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "nodejs",
+    "eventemitter",
+    "http",
+    "todo",
+    "callbacks",
+    "timers",
+    "lab-practical"
+  ],
+  "author": "Karthik",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "dependencies": {}
+}

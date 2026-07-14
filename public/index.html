@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Smart TO-DO Manager | Login</title>
+<link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+
+  <div class="login-wrapper">
+    <div class="login-card glass">
+      <h1>Smart TO-DO Manager</h1>
+      <p class="subtitle">Event-Driven Task Management • Node.js Core Only</p>
+
+      <div class="error-msg" id="errorMsg"></div>
+
+      <form id="loginForm">
+        <div class="input-group">
+          <label for="username">Username</label>
+          <input type="text" id="username" placeholder="Enter username" autocomplete="username" />
+        </div>
+
+        <div class="input-group">
+          <label for="password">Password</label>
+          <input type="password" id="password" placeholder="Enter password" autocomplete="current-password" />
+        </div>
+
+        <div class="remember-row">
+          <input type="checkbox" id="rememberMe" checked />
+          <label for="rememberMe">Remember me for this session</label>
+        </div>
+
+        <button type="submit" class="btn" id="loginBtn">Login</button>
+      </form>
+
+      <div class="demo-users">
+        Demo accounts:<br />
+        karthik / 1234 &nbsp;•&nbsp; admin / admin
+      </div>
+    </div>
+  </div>
+
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script src="/js/login.js"></script>
+</body>
+</html>
