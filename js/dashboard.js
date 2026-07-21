@@ -1,138 +1,188 @@
 /* ============================================================================
-   DASHBOARD CLIENT SCRIPT
-   Handles: auth guard, live clock, stats, task CRUD, search/filter/sort,
-   activity timeline polling, toast notification polling, keyboard shortcuts.
+   DASHBOARD.JS — Dashboard Client Script
+   Smart Event-Driven TO-DO Manager
+   ============================================================================
+   Handles:
+     • Auth guard (redirect if no session token)
+     • Live clock (setInterval)
+     • Dashboard stats polling
+     • Task CRUD (using MongoDB ObjectId _id strings)
+     • Search / filter / sort
+     • Activity timeline polling
+     • Toast notification polling (server-sent via in-memory queue)
+     • Keyboard shortcuts (Ctrl+K, Ctrl+N, Escape)
+     • Sidebar navigation
 ============================================================================ */
 
-/* ---------------- AUTH GUARD ---------------- */
-const token = sessionStorage.getItem("todo_token");
+"use strict";
+
+/* ============================================================================
+   AUTH GUARD
+============================================================================ */
+const token    = sessionStorage.getItem("todo_token");
 const username = sessionStorage.getItem("todo_username");
 
 if (!token) {
   window.location.href = "/index.html";
 }
 
-document.getElementById("welcomeTitle").textContent = `Welcome, ${username}!`;
+document.getElementById("welcomeTitle").textContent = `Welcome, ${username}! 👋`;
 
-/* ---------------- API HELPER (always attaches auth token) ---------------- */
+/* ============================================================================
+   API HELPER — always attaches Bearer token
+============================================================================ */
 function api(pathname, options = {}) {
   return fetch(pathname, {
     ...options,
     headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
+      "Content-Type":  "application/json",
+      "Authorization": `Bearer ${token}`,
       ...(options.headers || {})
     }
-  }).then((res) => res.json());
+  }).then((res) => {
+    if (res.status === 401) {
+      /* Session expired — go back to login */
+      sessionStorage.clear();
+      window.location.href = "/index.html";
+    }
+    return res.json();
+  });
 }
 
-/* ---------------- TOASTS ---------------- */
+/* ============================================================================
+   TOAST
+============================================================================ */
 function showToast(message, type = "info") {
   const container = document.getElementById("toastContainer");
-  const toast = document.createElement("div");
+  const toast     = document.createElement("div");
   toast.className = `toast glass ${type}`;
   toast.textContent = message;
   container.appendChild(toast);
   setTimeout(() => toast.remove(), 4000);
 }
 
-/* ---------------- LIVE CLOCK ---------------- */
+/* ============================================================================
+   LIVE CLOCK  (setInterval — client side)
+============================================================================ */
 function updateClock() {
   const now = new Date();
   document.getElementById("liveClock").textContent = now.toLocaleTimeString();
-  document.getElementById("liveDate").textContent = now.toLocaleDateString(undefined, {
+  document.getElementById("liveDate").textContent  = now.toLocaleDateString(undefined, {
     weekday: "short",
-    month: "short",
-    day: "numeric"
+    month:   "short",
+    day:     "numeric"
   });
 }
+
 updateClock();
 setInterval(updateClock, 1000);
 
-/* ---------------- DASHBOARD STATS ---------------- */
+/* ============================================================================
+   DASHBOARD STATS
+============================================================================ */
 function refreshDashboard() {
   api("/api/dashboard").then((data) => {
     if (!data.success) return;
     const s = data.stats;
-    document.getElementById("statTotal").textContent = s.totalTasks;
-    document.getElementById("statCompleted").textContent = s.completed;
-    document.getElementById("statPending").textContent = s.pending;
-    document.getElementById("statOverdue").textContent = s.overdue;
-    document.getElementById("statHigh").textContent = s.highPriority;
+    document.getElementById("statTotal").textContent       = s.totalTasks;
+    document.getElementById("statCompleted").textContent   = s.completed;
+    document.getElementById("statPending").textContent     = s.pending;
+    document.getElementById("statOverdue").textContent     = s.overdue;
+    document.getElementById("statHigh").textContent        = s.highPriority;
     document.getElementById("productivityLabel").textContent = `${s.productivity}%`;
-    document.getElementById("progressFill").style.width = `${s.productivity}%`;
+    document.getElementById("progressFill").style.width    = `${s.productivity}%`;
   });
 }
 
-/* ---------------- TASK RENDERING ---------------- */
-function priorityBadge(p) {
-  return `<span class="badge ${p}">${p}</span>`;
+/* ============================================================================
+   HTML ESCAPE (XSS protection)
+============================================================================ */
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str || "";
+  return div.innerHTML;
 }
+
+/* ============================================================================
+   TASK RENDERING
+   NOTE: Tasks from MongoDB use _id (24-char hex ObjectId string) — NOT integer id
+============================================================================ */
+function priorityBadge(p) {
+  return `<span class="badge ${escapeHtml(p)}">${escapeHtml(p)}</span>`;
+}
+
 function statusBadge(s) {
-  return `<span class="badge ${s}">${s}</span>`;
+  return `<span class="badge ${escapeHtml(s)}">${escapeHtml(s)}</span>`;
 }
 
 function renderTasks(taskArray) {
   const list = document.getElementById("taskList");
 
+  /* Update count label */
+  const countEl = document.getElementById("taskCount");
+  if (countEl) {
+    countEl.textContent = taskArray && taskArray.length
+      ? `${taskArray.length} task${taskArray.length !== 1 ? "s" : ""}`
+      : "";
+  }
+
   if (!taskArray || taskArray.length === 0) {
     list.innerHTML = `
       <div class="empty-state">
-        <div class="emoji">🗒️</div>
-        <div>No tasks found. Add your first task!</div>
+        <span class="emoji">🗒️</span>
+        <p>No tasks found. Add your first task!</p>
       </div>`;
     return;
   }
 
-  list.innerHTML = taskArray
-    .map((t) => {
-      const due = t.dueDate ? new Date(t.dueDate).toLocaleString() : "No due date";
-      return `
-      <div class="task-item priority-${t.priority} status-${t.status}" data-id="${t.id}">
-        <div class="task-top-row">
-          <div>
-            <div class="task-title ${t.status === "Completed" ? "done" : ""}">${escapeHtml(t.title)}</div>
-            <div class="task-desc">${escapeHtml(t.description || "")}</div>
-          </div>
-          <div class="task-actions">
-            ${
-              t.status === "Completed"
-                ? `<button class="icon-btn" title="Mark Pending" onclick="markPending(${t.id})">↺</button>`
-                : `<button class="icon-btn" title="Complete" onclick="completeTask(${t.id})">✔</button>`
-            }
-            <button class="icon-btn" title="Edit" onclick="openEditModal(${t.id})">✎</button>
-            <button class="icon-btn" title="Delete" onclick="deleteTask(${t.id})">🗑</button>
-          </div>
+  list.innerHTML = taskArray.map((t) => {
+    const due      = t.dueDate ? new Date(t.dueDate).toLocaleString() : "No due date";
+    const isDone   = t.status === "Completed";
+    const isOverdue = t.status === "Overdue";
+
+    return `
+    <div class="task-item priority-${escapeHtml(t.priority)} status-${escapeHtml(t.status)}"
+         data-id="${escapeHtml(t._id)}">
+      <div class="task-top-row">
+        <div style="min-width:0;flex:1">
+          <div class="task-title ${isDone ? "done" : ""}">${escapeHtml(t.title)}</div>
+          ${t.description ? `<div class="task-desc">${escapeHtml(t.description)}</div>` : ""}
         </div>
-        <div class="task-meta">
-          ${priorityBadge(t.priority)}
-          ${statusBadge(t.status)}
-          <span class="text-muted">📅 ${due}</span>
+        <div class="task-actions">
+          ${isDone
+            ? `<button class="icon-btn" title="Mark Pending"  onclick="markTaskPending('${t._id}')">↺</button>`
+            : `<button class="icon-btn" title="Complete Task" onclick="markTaskComplete('${t._id}')">✔</button>`
+          }
+          <button class="icon-btn" title="Edit Task"   onclick="openEditModal('${t._id}')">✎</button>
+          <button class="icon-btn" title="Delete Task" onclick="deleteTaskById('${t._id}')">🗑</button>
         </div>
-      </div>`;
-    })
-    .join("");
+      </div>
+      <div class="task-meta">
+        ${priorityBadge(t.priority)}
+        ${statusBadge(t.status)}
+        <span class="text-muted">📅 ${escapeHtml(due)}</span>
+        ${isOverdue ? '<span style="color:var(--danger);font-size:11px;font-weight:700;">⚠ OVERDUE</span>' : ""}
+      </div>
+    </div>`;
+  }).join("");
 }
 
-function escapeHtml(str) {
-  const div = document.createElement("div");
-  div.textContent = str;
-  return div.innerHTML;
-}
-
+/* ============================================================================
+   TASK LOADING  (with search / filter / sort)
+============================================================================ */
 let currentTasksCache = [];
 
 function loadTasks() {
-  const search = document.getElementById("searchInput").value.trim();
+  const search   = document.getElementById("searchInput").value.trim();
   const priority = document.getElementById("priorityFilter").value;
-  const status = document.getElementById("statusFilter").value;
-  const sort = document.getElementById("sortFilter").value;
+  const status   = document.getElementById("statusFilter").value;
+  const sort     = document.getElementById("sortFilter").value;
 
   const params = new URLSearchParams();
-  if (search) params.set("search", search);
+  if (search)                    params.set("search",   search);
   if (priority && priority !== "All") params.set("priority", priority);
-  if (status && status !== "All") params.set("status", status);
-  if (sort) params.set("sort", sort);
+  if (status   && status   !== "All") params.set("status",   status);
+  if (sort)                      params.set("sort",     sort);
 
   api(`/api/tasks?${params.toString()}`).then((data) => {
     if (!data.success) return;
@@ -141,98 +191,138 @@ function loadTasks() {
   });
 }
 
-/* ---------------- TASK ACTIONS (exposed globally for inline onclick) ---------------- */
-window.completeTask = function (id) {
+/* ============================================================================
+   TASK ACTIONS  (globally scoped for inline onclick attributes)
+============================================================================ */
+
+/* Complete a task */
+window.markTaskComplete = function (id) {
   api(`/api/tasks/${id}/complete`, { method: "POST" }).then((data) => {
     if (data.success) {
-      showToast(`Task completed: "${data.task.title}"`, "success");
+      showToast(`✅ Completed: "${data.task.title}"`, "success");
       loadTasks();
       refreshDashboard();
+    } else {
+      showToast(data.message || "Could not complete task", "error");
     }
   });
 };
 
-window.markPending = function (id) {
+/* Mark a task back to Pending */
+window.markTaskPending = function (id) {
   api(`/api/tasks/${id}/pending`, { method: "POST" }).then((data) => {
     if (data.success) {
-      showToast(`Task marked pending: "${data.task.title}"`, "info");
+      showToast(`↺ Marked pending: "${data.task.title}"`, "info");
       loadTasks();
       refreshDashboard();
+    } else {
+      showToast(data.message || "Could not update task", "error");
     }
   });
 };
 
-window.deleteTask = function (id) {
-  if (!confirm("Delete this task?")) return;
+/* Delete a task */
+window.deleteTaskById = function (id) {
+  if (!confirm("Delete this task? This cannot be undone.")) return;
   api(`/api/tasks/${id}`, { method: "DELETE" }).then((data) => {
     if (data.success) {
-      showToast(`Task deleted: "${data.task.title}"`, "error");
+      showToast(`🗑 Deleted: "${data.task.title}"`, "error");
       loadTasks();
       refreshDashboard();
+    } else {
+      showToast(data.message || "Could not delete task", "error");
     }
   });
 };
 
+/* Open edit modal — look up task in the cache by _id */
 window.openEditModal = function (id) {
-  const task = currentTasksCache.find((t) => t.id === id);
-  if (!task) return;
-  document.getElementById("modalTitle").textContent = "Edit Task";
-  document.getElementById("taskId").value = task.id;
-  document.getElementById("taskTitle").value = task.title;
-  document.getElementById("taskDescription").value = task.description;
-  document.getElementById("taskPriority").value = task.priority;
-  document.getElementById("taskDueDate").value = task.dueDate ? task.dueDate.slice(0, 16) : "";
+  const task = currentTasksCache.find((t) => t._id === id);
+  if (!task) { showToast("Task not found in cache. Please refresh.", "error"); return; }
+
+  document.getElementById("modalTitle").textContent    = "Edit Task";
+  document.getElementById("taskId").value              = task._id;
+  document.getElementById("taskTitle").value           = task.title;
+  document.getElementById("taskDescription").value     = task.description || "";
+  document.getElementById("taskPriority").value        = task.priority;
+  document.getElementById("taskDueDate").value         = task.dueDate
+    ? new Date(task.dueDate).toISOString().slice(0, 16)
+    : "";
+
   document.getElementById("taskModal").classList.add("open");
 };
 
-/* ---------------- MODAL CONTROLS ---------------- */
+/* ============================================================================
+   MODAL CONTROLS
+============================================================================ */
 const taskModal = document.getElementById("taskModal");
 
 function openAddModal() {
   document.getElementById("modalTitle").textContent = "Add New Task";
   document.getElementById("taskForm").reset();
-  document.getElementById("taskId").value = "";
+  document.getElementById("taskId").value           = "";
   taskModal.classList.add("open");
 }
 
 document.getElementById("openAddTaskBtn").addEventListener("click", openAddModal);
-document.getElementById("cancelModalBtn").addEventListener("click", () => taskModal.classList.remove("open"));
+
+document.getElementById("cancelModalBtn").addEventListener("click", () => {
+  taskModal.classList.remove("open");
+});
+
+/* Click outside the modal box to close */
 taskModal.addEventListener("click", (e) => {
   if (e.target === taskModal) taskModal.classList.remove("open");
 });
 
+/* ── Save Task (Add or Edit) ── */
 document.getElementById("taskForm").addEventListener("submit", (e) => {
   e.preventDefault();
-  const id = document.getElementById("taskId").value;
+
+  const id      = document.getElementById("taskId").value;
+  const title   = document.getElementById("taskTitle").value.trim();
+  const saveBtn = document.getElementById("saveTaskBtn");
+
+  if (!title) { showToast("Task title is required", "error"); return; }
+
   const payload = {
-    title: document.getElementById("taskTitle").value.trim(),
+    title,
     description: document.getElementById("taskDescription").value.trim(),
-    priority: document.getElementById("taskPriority").value,
-    dueDate: document.getElementById("taskDueDate").value || null
+    priority:    document.getElementById("taskPriority").value,
+    dueDate:     document.getElementById("taskDueDate").value || null
   };
 
+  saveBtn.textContent = "Saving…";
+  saveBtn.disabled    = true;
+
   const request = id
-    ? api(`/api/tasks/${id}`, { method: "PUT", body: JSON.stringify(payload) })
-    : api("/api/tasks", { method: "POST", body: JSON.stringify(payload) });
+    ? api(`/api/tasks/${id}`, { method: "PUT",  body: JSON.stringify(payload) })
+    : api("/api/tasks",       { method: "POST", body: JSON.stringify(payload) });
 
   request.then((data) => {
+    saveBtn.textContent = "Save Task";
+    saveBtn.disabled    = false;
+
     if (!data.success) {
       showToast(data.message || "Something went wrong", "error");
       return;
     }
-    showToast(id ? `Task updated: "${data.task.title}"` : `Task added: "${data.task.title}"`, "success");
+
+    const verb = id ? "Updated" : "Added";
+    showToast(`${verb}: "${data.task.title}"`, "success");
     taskModal.classList.remove("open");
     loadTasks();
     refreshDashboard();
+  }).catch(() => {
+    saveBtn.textContent = "Save Task";
+    saveBtn.disabled    = false;
+    showToast("Server error — please try again", "error");
   });
 });
 
-/* ---------------- FILTER / SEARCH / SORT LISTENERS ---------------- */
-document.getElementById("searchInput").addEventListener("input", debounce(loadTasks, 300));
-document.getElementById("priorityFilter").addEventListener("change", loadTasks);
-document.getElementById("statusFilter").addEventListener("change", loadTasks);
-document.getElementById("sortFilter").addEventListener("change", loadTasks);
-
+/* ============================================================================
+   SEARCH / FILTER / SORT
+============================================================================ */
 function debounce(fn, delay) {
   let timer;
   return (...args) => {
@@ -241,31 +331,55 @@ function debounce(fn, delay) {
   };
 }
 
-/* ---------------- ACTIVITY TIMELINE ---------------- */
+document.getElementById("searchInput").addEventListener("input",  debounce(loadTasks, 300));
+document.getElementById("priorityFilter").addEventListener("change", loadTasks);
+document.getElementById("statusFilter").addEventListener("change",   loadTasks);
+document.getElementById("sortFilter").addEventListener("change",     loadTasks);
+
+/* ============================================================================
+   ACTIVITY TIMELINE
+============================================================================ */
+const EVENT_LABELS = {
+  login:           "Login",
+  logout:          "Logout",
+  register:        "Registered",
+  taskCreated:     "Task Created",
+  taskUpdated:     "Task Updated",
+  taskCompleted:   "Completed",
+  taskDeleted:     "Deleted",
+  overdue:         "Overdue",
+  reminder:        "Reminder",
+  reminderCancelled: "Reminder Cancelled"
+};
+
 function loadActivity() {
   api("/api/activity").then((data) => {
     if (!data.success) return;
     const list = document.getElementById("timelineList");
+
     if (data.activity.length === 0) {
-      list.innerHTML = `<div class="empty-state"><div>No activity yet.</div></div>`;
+      list.innerHTML = `<div class="empty-state"><p>No activity yet.</p></div>`;
       return;
     }
-    list.innerHTML = data.activity
-      .map(
-        (a) => `
-        <div class="timeline-item">
-          <div class="dot"></div>
-          <div>
-            <div class="t-time">${a.time}</div>
-            <div>${escapeHtml(a.message)}</div>
-          </div>
-        </div>`
-      )
-      .join("");
+
+    list.innerHTML = data.activity.map((a) => {
+      const label = EVENT_LABELS[a.event] || a.event;
+      return `
+      <div class="timeline-item ev-${escapeHtml(a.event)}">
+        <div class="dot"></div>
+        <div>
+          <div class="t-time">${escapeHtml(a.time)}</div>
+          <div class="t-msg">${escapeHtml(a.description || label)}</div>
+          <div class="t-user">@${escapeHtml(a.username)}</div>
+        </div>
+      </div>`;
+    }).join("");
   });
 }
 
-/* ---------------- NOTIFICATION POLLING (toast popups) ---------------- */
+/* ============================================================================
+   NOTIFICATION POLLING  (toast pop-ups from server event queue)
+============================================================================ */
 let lastNotificationId = 0;
 
 function pollNotifications() {
@@ -278,7 +392,9 @@ function pollNotifications() {
   });
 }
 
-/* ---------------- LOGOUT ---------------- */
+/* ============================================================================
+   LOGOUT
+============================================================================ */
 document.getElementById("logoutBtn").addEventListener("click", () => {
   api("/api/logout", { method: "POST" }).finally(() => {
     sessionStorage.removeItem("todo_token");
@@ -287,7 +403,9 @@ document.getElementById("logoutBtn").addEventListener("click", () => {
   });
 });
 
-/* ---------------- KEYBOARD SHORTCUTS ---------------- */
+/* ============================================================================
+   KEYBOARD SHORTCUTS
+============================================================================ */
 document.addEventListener("keydown", (e) => {
   if (e.ctrlKey && e.key.toLowerCase() === "k") {
     e.preventDefault();
@@ -302,11 +420,14 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-/* ---------------- SIDEBAR NAV (simple section scroll/highlight) ---------------- */
+/* ============================================================================
+   SIDEBAR NAVIGATION
+============================================================================ */
 document.querySelectorAll(".nav-item[data-section]").forEach((item) => {
   item.addEventListener("click", () => {
     document.querySelectorAll(".nav-item[data-section]").forEach((i) => i.classList.remove("active"));
     item.classList.add("active");
+
     const section = item.dataset.section;
     if (section === "tasks") {
       document.querySelector(".content-grid").scrollIntoView({ behavior: "smooth" });
@@ -318,12 +439,14 @@ document.querySelectorAll(".nav-item[data-section]").forEach((item) => {
   });
 });
 
-/* ---------------- INITIAL LOAD + POLLING INTERVALS ---------------- */
+/* ============================================================================
+   INITIAL LOAD + POLLING INTERVALS
+============================================================================ */
 refreshDashboard();
 loadTasks();
 loadActivity();
 
-setInterval(refreshDashboard, 5000);   // keep stat cards fresh
-setInterval(loadTasks, 10000);         // keep task list fresh (e.g. overdue status)
-setInterval(loadActivity, 5000);       // keep activity timeline fresh
-setInterval(pollNotifications, 3000);  // pick up toast notifications from the server
+setInterval(refreshDashboard,    5000);   // keep stat cards fresh
+setInterval(loadTasks,          10000);   // keep task list fresh (overdue status)
+setInterval(loadActivity,        5000);   // keep activity timeline fresh
+setInterval(pollNotifications,   3000);   // pick up server-emitted toasts

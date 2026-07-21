@@ -1,465 +1,606 @@
 /* ============================================================================
-   SMART EVENT-DRIVEN TO-DO MANAGER
+   SERVER.JS — Smart Event-Driven TO-DO Manager
    ----------------------------------------------------------------------------
    Node.js Laboratory Practical Project
-   Uses ONLY Node.js built-in modules: http, url, fs, path, events, querystring
-   NO Express.js / NO Database / NO external frameworks
+   Stack : Node.js built-in HTTP module • MongoDB (official driver) • EventEmitter
+   No Express.js • No Mongoose • No external frameworks
+   ============================================================================
+
+   Required Node.js concepts demonstrated
+   ──────────────────────────────────────
+   ✔ http.createServer()        — manual HTTP server & routing
+   ✔ EventEmitter               — central event bus (taskEmitter)
+   ✔ emit()                     — raise domain events
+   ✔ on()                       — persistent listeners
+   ✔ once()                     — one-shot listeners
+   ✔ setTimeout()               — per-task reminder after 30 s
+   ✔ clearTimeout()             — cancel reminder on delete / complete
+   ✔ setInterval()              — background overdue-check every 15 s
+   ✔ clearInterval()            — clean-up on SIGINT
+   ✔ setImmediate()             — post-I/O dashboard refresh
+   ✔ clearImmediate()           — cancel deferred work on validation failure
+   ✔ Callback functions         — all DB operations follow (err, result) style
+   ✔ MongoDB driver             — full CRUD via official mongodb package
 ============================================================================ */
 
-const http = require("http");
-const fs = require("fs");
-const path = require("path");
-const url = require("url");
+"use strict";
+
+/* ── Built-in modules ─────────────────────────────────────────────────── */
+const http         = require("http");
+const fs           = require("fs");
+const path         = require("path");
+const url          = require("url");
 const EventEmitter = require("events");
+const { ObjectId } = require("mongodb");
+
+/* ── Application modules ──────────────────────────────────────────────── */
+const config = require("./config");
+const mongo  = require("./database/mongo");
 
 /* ============================================================================
-   1. IN-MEMORY DATA STORE (no database is allowed in this project)
+   1. IN-MEMORY EPHEMERAL STATE
+   ----------------------------------------------------------------------------
+   Only data that does NOT need to survive a server restart lives in memory:
+     • sessions    — token → username map
+     • notifications — toast queue polled by the frontend
+     • reminderTimers — setTimeout handles (cannot be serialised to DB)
+     • stats       — server-lifetime counters
 ============================================================================ */
 
-// Predefined users for login
-const users = [
-  { username: "karthik", password: "1234" },
-  { username: "admin", password: "admin" }
-];
+const sessions       = {};   // token → username
+const notifications  = [];   // pending toast messages for the frontend
+const reminderTimers = {};   // taskId(string) → setTimeout handle
 
-// All tasks are stored here (array of objects)
-const tasks = [];
-
-// Every activity (login, task created, reminder etc.) is logged here
-const activityLogs = [];
-
-// Toast notifications waiting to be picked up by the frontend (polling)
-const notifications = [];
-
-// token -> username   (very small in-memory "session" store, session only)
-const sessions = {};
-
-// taskId -> setTimeout handle for that task's reminder.
-// Kept OUTSIDE the task object itself so tasks stay plain, JSON-serializable
-// objects (a Timeout handle contains circular references and cannot be
-// sent to the browser as JSON).
-const reminderTimers = {};
-
-// Running id counters
-let taskIdCounter = 1;
-let activityIdCounter = 1;
 let notificationIdCounter = 1;
 
-// Session / lab statistics (used in the Session Summary printed every 60s)
 const stats = {
   serverStartTime: Date.now(),
-  visitors: 0,
-  loggedUsers: new Set(),
-  tasksCreated: 0,
-  tasksUpdated: 0,
-  tasksCompleted: 0,
-  tasksDeleted: 0,
-  remindersSent: 0
+  visitors:        0,
+  loggedUsers:     new Set(),
+  tasksCreated:    0,
+  tasksUpdated:    0,
+  tasksCompleted:  0,
+  tasksDeleted:    0,
+  remindersSent:   0
 };
 
 /* ============================================================================
-   2. EVENTEMITTER SETUP
-   ----------------------------------------------------------------------------
-   taskEmitter is the central nervous system of the whole application.
-   Every important thing that happens in the app is emit()-ed here, and a
-   single set of on() listeners react to it (log to console, store activity,
-   push a toast notification, and mark the dashboard as "dirty").
+   2. EVENT EMITTER — CENTRAL NERVOUS SYSTEM
 ============================================================================ */
 
 const taskEmitter = new EventEmitter();
+taskEmitter.setMaxListeners(20);
 
-/* ---------- small helper: pretty console section printer ---------- */
+/* ── Pretty console section printer ── */
 function printSection(title, lines = []) {
   console.log("\n========================================");
-  console.log(title);
+  console.log(` ${title}`);
   console.log("========================================");
-  lines.forEach((l) => console.log(l));
+  lines.forEach((l) => console.log("  " + l));
 }
 
-/* ---------- helper: store an activity log entry ---------- */
-function addActivity(message, type = "info") {
-  const entry = {
-    id: activityIdCounter++,
-    time: new Date().toLocaleTimeString(),
-    message,
-    type
-  };
-  activityLogs.push(entry);
-  if (activityLogs.length > 200) activityLogs.shift(); // keep memory bounded
-  return entry;
-}
-
-/* ---------- helper: push a toast notification for the frontend ---------- */
+/* ── Push toast to the frontend notification queue ── */
 function pushNotification(message, type = "info") {
   const note = {
-    id: notificationIdCounter++,
+    id:      notificationIdCounter++,
     message,
     type,
-    time: new Date().toLocaleTimeString()
+    time:    new Date().toLocaleTimeString()
   };
   notifications.push(note);
   if (notifications.length > 100) notifications.shift();
   return note;
 }
 
-/* dashboard "dirty" flag - flipped true whenever data changes so the
-   frontend polling /api/dashboard always gets a fresh snapshot */
+/* ── Write an entry to the MongoDB ActivityLogs collection ── */
+function addActivity(username, event, description, callback) {
+  const entry = {
+    username:    username || "system",
+    event,
+    description,
+    timestamp:   new Date()
+  };
+  mongo.activityLogs().insertOne(entry, (err) => {
+    if (err) console.error("[ActivityLog] Insert error:", err.message);
+    if (callback) callback(err, entry);
+  });
+}
+
+/* ── Dashboard dirty flag (set after any write, cleared on GET /api/dashboard) ── */
 let dashboardDirty = true;
 
 /* ============================================================================
-   3. on() LISTENERS  -  fire EVERY time the related event is emitted
+   3. on() LISTENERS — fire EVERY time the related event is emitted
 ============================================================================ */
 
-// ---- LOGIN ----
 taskEmitter.on("login", (username) => {
   printSection("LOGIN SUCCESS", [`User : ${username}`]);
-  addActivity(`Login - ${username}`, "login");
+  addActivity(username, "login", `User ${username} logged in`);
   pushNotification(`Welcome back, ${username}!`, "success");
+  stats.visitors++;
+  stats.loggedUsers.add(username);
 });
 
-// ---- LOGOUT ----
 taskEmitter.on("logout", (username) => {
   printSection("LOGOUT", [`User : ${username}`]);
-  addActivity(`Logout - ${username}`, "logout");
+  addActivity(username, "logout", `User ${username} logged out`);
   pushNotification(`${username} logged out`, "info");
 });
 
-// ---- TASK CREATED ----
-taskEmitter.on("taskCreated", (task) => {
-  printSection("TASK CREATED", [`Title : ${task.title}`, `Priority : ${task.priority}`]);
-  addActivity(`Task Created - "${task.title}"`, "created");
+taskEmitter.on("register", (username) => {
+  printSection("NEW USER REGISTERED", [`User : ${username}`]);
+  addActivity(username, "register", `New user ${username} registered`);
+  pushNotification(`Welcome ${username}! Your account was created.`, "success");
+});
+
+taskEmitter.on("taskCreated", (username, task) => {
+  printSection("TASK CREATED", [
+    `Title    : ${task.title}`,
+    `Priority : ${task.priority}`,
+    `User     : ${username}`
+  ]);
+  addActivity(username, "taskCreated", `Task created: "${task.title}"`);
   pushNotification(`Task added: "${task.title}"`, "success");
   stats.tasksCreated++;
+  dashboardDirty = true;
 });
 
-// ---- TASK UPDATED ----
-taskEmitter.on("taskUpdated", (task) => {
-  printSection("TASK UPDATED", [`Title : ${task.title}`]);
-  addActivity(`Task Updated - "${task.title}"`, "updated");
+taskEmitter.on("taskUpdated", (username, task) => {
+  printSection("TASK UPDATED", [`Title : ${task.title}`, `User  : ${username}`]);
+  addActivity(username, "taskUpdated", `Task updated: "${task.title}"`);
   pushNotification(`Task updated: "${task.title}"`, "info");
   stats.tasksUpdated++;
+  dashboardDirty = true;
 });
 
-// ---- TASK DELETED ----
-taskEmitter.on("taskDeleted", (task) => {
-  printSection("TASK DELETED", [`Title : ${task.title}`]);
-  addActivity(`Task Deleted - "${task.title}"`, "deleted");
+taskEmitter.on("taskDeleted", (username, task) => {
+  printSection("TASK DELETED", [`Title : ${task.title}`, `User  : ${username}`]);
+  addActivity(username, "taskDeleted", `Task deleted: "${task.title}"`);
   pushNotification(`Task deleted: "${task.title}"`, "error");
   stats.tasksDeleted++;
+  dashboardDirty = true;
 });
 
-// ---- TASK COMPLETED ----
-taskEmitter.on("taskCompleted", (task) => {
-  printSection("TASK COMPLETED", [`Title : ${task.title}`]);
-  addActivity(`Task Completed - "${task.title}"`, "completed");
-  pushNotification(`Task completed: "${task.title}"`, "success");
+taskEmitter.on("taskCompleted", (username, task) => {
+  printSection("TASK COMPLETED", [`Title : ${task.title}`, `User  : ${username}`]);
+  addActivity(username, "taskCompleted", `Task completed: "${task.title}"`);
+  pushNotification(`✅ Task completed: "${task.title}"`, "success");
   stats.tasksCompleted++;
+  dashboardDirty = true;
 });
 
-// ---- TASK REMINDER (fired by setTimeout, 30s after creation) ----
 taskEmitter.on("taskReminder", (task) => {
-  printSection("REMINDER SENT", [`Complete your task`, `${task.title}`]);
-  addActivity(`Reminder Sent - "${task.title}"`, "reminder");
-  pushNotification(`Reminder: complete "${task.title}"`, "warning");
+  printSection("⏰ REMINDER SENT", [`Complete your task: ${task.title}`]);
+  addActivity("system", "reminder", `Reminder: "${task.title}" is still pending`);
+  pushNotification(`⏰ Reminder: complete "${task.title}"`, "warning");
   stats.remindersSent++;
 });
 
-// ---- TASK OVERDUE (fired by setInterval monitor every 15s) ----
 taskEmitter.on("taskOverdue", (task) => {
-  printSection("CHECKING OVERDUE TASKS", [`Overdue : ${task.title}`]);
-  addActivity(`Task Overdue - "${task.title}"`, "overdue");
-  pushNotification(`Task overdue: "${task.title}"`, "error");
+  printSection("⚠ TASK OVERDUE", [`Overdue : ${task.title}`]);
+  addActivity("system", "overdue", `Task overdue: "${task.title}"`);
+  pushNotification(`⚠ Task overdue: "${task.title}"`, "error");
+  dashboardDirty = true;
 });
 
-// ---- DASHBOARD UPDATED (fired via setImmediate after any task change) ----
 taskEmitter.on("dashboardUpdated", () => {
   dashboardDirty = true;
 });
 
 /* ============================================================================
-   4. once() LISTENERS
-   ----------------------------------------------------------------------------
-   These events are emitted EVERY time login/task-creation happens, but
-   because they are registered with once(), the handler body below will only
-   ever run for the very first occurrence after the server starts.
+   4. once() LISTENERS — handler body runs only for the FIRST occurrence
 ============================================================================ */
 
 taskEmitter.once("firstLogin", (username) => {
   console.log("\n****************************************");
-  console.log(" Welcome!");
-  console.log(` This is the first login after server start (${username}).`);
+  console.log(` First login since server start: ${username}`);
   console.log("****************************************\n");
-  pushNotification("Welcome! This is the first login since the server started.", "success");
+  pushNotification("Welcome! First login since the server started.", "success");
 });
 
 taskEmitter.once("firstTaskCreated", (task) => {
   console.log("\n****************************************");
-  console.log(" Congratulations!");
-  console.log(` First Task Created: "${task.title}"`);
+  console.log(` First task created: "${task.title}"`);
   console.log("****************************************\n");
-  pushNotification("Congratulations! You created your first task.", "success");
+  pushNotification(`🎉 Congratulations! First task: "${task.title}"`, "success");
 });
 
 /* ============================================================================
-   5. CORE APPLICATION LOGIC  -  ALL USE CALLBACK FUNCTIONS  callback(err, result)
+   5. CORE APPLICATION LOGIC — ALL USE CALLBACK FUNCTIONS (err, result)
 ============================================================================ */
 
-// ---------------- LOGIN ----------------
-function loginUser(username, password, callback) {
-  // simulate async work with process.nextTick (still a callback pattern)
-  process.nextTick(() => {
-    const user = users.find((u) => u.username === username && u.password === password);
-    if (!user) {
-      return callback(new Error("Invalid username or password"));
-    }
-    const token = `tok_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
-    sessions[token] = username;
-    stats.visitors++;
-    stats.loggedUsers.add(username);
+/* ── Helper: safely convert a string to a MongoDB ObjectId ── */
+function toObjectId(id) {
+  try { return new ObjectId(id); }
+  catch (_) { return null; }
+}
 
-    taskEmitter.emit("login", username);   // regular listener -> runs every time
-    taskEmitter.emit("firstLogin", username); // once listener -> runs only the first time ever
+/* ────────────────────────────────── LOGIN ────────────────────────────── */
+function loginUser(username, password, callback) {
+  mongo.users().findOne({ username, password }, (err, user) => {
+    if (err)   return callback(err);
+    if (!user) return callback(new Error("Invalid username or password"));
+
+    const token = `${config.TOKEN_PREFIX}${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    sessions[token] = username;
+
+    taskEmitter.emit("login", username);
+    taskEmitter.emit("firstLogin", username); // once() — only fires first time
 
     callback(null, { token, username });
   });
 }
 
-// ---------------- LOGOUT ----------------
-function logoutUser(token, callback) {
-  process.nextTick(() => {
-    const username = sessions[token];
-    if (!username) return callback(new Error("Not logged in"));
-    delete sessions[token];
-    taskEmitter.emit("logout", username);
-    callback(null, { message: "Logged out successfully" });
+/* ────────────────────────────────── REGISTER ─────────────────────────── */
+function registerUser(username, password, callback) {
+  if (!username || !password || username.trim() === "" || password.trim() === "") {
+    return process.nextTick(() => callback(new Error("Username and password are required")));
+  }
+  if (username.length < 3) {
+    return process.nextTick(() => callback(new Error("Username must be at least 3 characters")));
+  }
+  if (password.length < 4) {
+    return process.nextTick(() => callback(new Error("Password must be at least 4 characters")));
+  }
+
+  /* Check for duplicate username */
+  mongo.users().findOne({ username }, (err, existing) => {
+    if (err)      return callback(err);
+    if (existing) return callback(new Error("Username already taken"));
+
+    const doc = {
+      username:  username.trim(),
+      password:  password.trim(),
+      createdAt: new Date()
+    };
+
+    mongo.users().insertOne(doc, (insertErr, result) => {
+      if (insertErr) return callback(insertErr);
+
+      const token = `${config.TOKEN_PREFIX}${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+      sessions[token] = username;
+
+      taskEmitter.emit("register", username);
+
+      callback(null, { token, username });
+    });
   });
 }
 
-// ---------------- ADD TASK ----------------
-function addTask(taskData, callback) {
-  // Basic validation - if it fails we demonstrate setImmediate + clearImmediate
+/* ────────────────────────────────── LOGOUT ───────────────────────────── */
+function logoutUser(token, callback) {
+  const username = sessions[token];
+  if (!username) return process.nextTick(() => callback(new Error("Not logged in")));
+  delete sessions[token];
+  taskEmitter.emit("logout", username);
+  process.nextTick(() => callback(null, { message: "Logged out successfully" }));
+}
+
+/* ────────────────────────────────── ADD TASK ─────────────────────────── */
+function addTask(username, taskData, callback) {
+  /* Validation — demonstrate setImmediate + clearImmediate on failure */
   if (!taskData || !taskData.title || taskData.title.trim() === "") {
     const failImmediate = setImmediate(() => {
-      console.log("This will never print - immediate was cancelled");
+      console.log("[addTask] This deferred work was cancelled.");
     });
-    clearImmediate(failImmediate); // cancel the scheduled immediate
-    printSection("TASK OPERATION FAILED", ["Reason : Title is required", "Immediate execution cancelled (clearImmediate)"]);
-    return callback(new Error("Task title is required"));
+    clearImmediate(failImmediate);
+    printSection("TASK OPERATION FAILED", [
+      "Reason : Title is required",
+      "Note   : setImmediate was scheduled then cancelled (clearImmediate)"
+    ]);
+    return process.nextTick(() => callback(new Error("Task title is required")));
   }
 
-  const task = {
-    id: taskIdCounter++,
-    title: taskData.title.trim(),
+  const doc = {
+    userId:      username,
+    title:       taskData.title.trim(),
     description: taskData.description || "",
-    priority: taskData.priority || "Medium",
-    dueDate: taskData.dueDate || null,
-    status: "Pending",
-    createdTime: new Date().toISOString(),
-    completedTime: null
+    priority:    taskData.priority    || "Medium",
+    dueDate:     taskData.dueDate     ? new Date(taskData.dueDate) : null,
+    status:      "Pending",
+    createdAt:   new Date(),
+    completedAt: null
   };
 
-  tasks.push(task);
+  mongo.tasks().insertOne(doc, (err, result) => {
+    if (err) return callback(err);
 
-  // ---- setTimeout(): schedule an automatic reminder 30 seconds from now ----
-  // The timer handle is stored in reminderTimers (NOT on the task object)
-  // so the task remains plain and JSON-serializable.
-  reminderTimers[task.id] = setTimeout(() => {
-    const stillExists = tasks.find((t) => t.id === task.id);
-    if (stillExists && stillExists.status !== "Completed") {
-      taskEmitter.emit("taskReminder", stillExists);
+    const task = { ...doc, _id: result.insertedId };
+
+    /* ── setTimeout: automatic reminder 30 s after creation ── */
+    const timerId = setTimeout(() => {
+      /* Re-query the task from DB to get its current status */
+      mongo.tasks().findOne({ _id: result.insertedId }, (qErr, latest) => {
+        if (latest && latest.status !== "Completed" && latest.status !== "Deleted") {
+          taskEmitter.emit("taskReminder", latest);
+        }
+        delete reminderTimers[result.insertedId.toString()];
+      });
+    }, config.REMINDER_DELAY_MS);
+
+    reminderTimers[result.insertedId.toString()] = timerId;
+
+    taskEmitter.emit("taskCreated", username, task);
+    taskEmitter.emit("firstTaskCreated", task); // once() — only fires first time
+
+    /* ── setImmediate: emit dashboardUpdated after current I/O cycle ── */
+    setImmediate(() => {
+      taskEmitter.emit("dashboardUpdated");
+    });
+
+    callback(null, task);
+  });
+}
+
+/* ────────────────────────────────── UPDATE TASK ──────────────────────── */
+function updateTask(username, id, data, callback) {
+  const oid = toObjectId(id);
+  if (!oid) {
+    const failImmediate = setImmediate(() => {});
+    clearImmediate(failImmediate);
+    return process.nextTick(() => callback(new Error("Invalid task ID")));
+  }
+
+  const $set = {};
+  if (data.title       !== undefined) $set.title       = data.title;
+  if (data.description !== undefined) $set.description = data.description;
+  if (data.priority    !== undefined) $set.priority    = data.priority;
+  if (data.dueDate     !== undefined) $set.dueDate     = data.dueDate ? new Date(data.dueDate) : null;
+  if (data.status      !== undefined) $set.status      = data.status;
+
+  mongo.tasks().findOneAndUpdate(
+    { _id: oid },
+    { $set },
+    { returnDocument: "after" },
+    (err, result) => {
+      if (err)    return callback(err);
+      if (!result) return callback(new Error("Task not found"));
+
+      const task = result;
+
+      taskEmitter.emit("taskUpdated", username, task);
+
+      setImmediate(() => {
+        taskEmitter.emit("dashboardUpdated");
+      });
+
+      callback(null, task);
     }
-    delete reminderTimers[task.id];
-  }, 30000);
-
-  taskEmitter.emit("taskCreated", task);       // fires every time
-  taskEmitter.emit("firstTaskCreated", task);  // fires (handled) only the first time
-
-  // ---- setImmediate(): refresh dashboard + write activity log right after I/O ----
-  setImmediate(() => {
-    taskEmitter.emit("dashboardUpdated");
-  });
-
-  callback(null, task);
+  );
 }
 
-// ---------------- UPDATE TASK ----------------
-function updateTask(id, data, callback) {
-  const task = tasks.find((t) => t.id === Number(id));
-  if (!task) {
+/* ────────────────────────────────── DELETE TASK ──────────────────────── */
+function deleteTask(username, id, callback) {
+  const oid = toObjectId(id);
+  if (!oid) {
     const failImmediate = setImmediate(() => {});
     clearImmediate(failImmediate);
-    return callback(new Error("Task not found"));
+    return process.nextTick(() => callback(new Error("Invalid task ID")));
   }
 
-  if (data.title !== undefined) task.title = data.title;
-  if (data.description !== undefined) task.description = data.description;
-  if (data.priority !== undefined) task.priority = data.priority;
-  if (data.dueDate !== undefined) task.dueDate = data.dueDate;
-  if (data.status !== undefined) task.status = data.status;
+  mongo.tasks().findOneAndDelete({ _id: oid }, (err, result) => {
+    if (err)    return callback(err);
+    if (!result) return callback(new Error("Task not found"));
 
-  taskEmitter.emit("taskUpdated", task);
+    const removed = result;
 
-  setImmediate(() => {
-    taskEmitter.emit("dashboardUpdated");
+    /* ── clearTimeout: cancel reminder for deleted task ── */
+    const key = oid.toString();
+    if (reminderTimers[key]) {
+      clearTimeout(reminderTimers[key]);
+      delete reminderTimers[key];
+      console.log(`  [clearTimeout] Reminder cancelled — task deleted: "${removed.title}"`);
+    }
+
+    taskEmitter.emit("taskDeleted", username, removed);
+
+    setImmediate(() => {
+      taskEmitter.emit("dashboardUpdated");
+    });
+
+    callback(null, removed);
   });
-
-  callback(null, task);
 }
 
-// ---------------- DELETE TASK ----------------
-function deleteTask(id, callback) {
-  const index = tasks.findIndex((t) => t.id === Number(id));
-  if (index === -1) {
-    const failImmediate = setImmediate(() => {});
-    clearImmediate(failImmediate);
-    return callback(new Error("Task not found"));
-  }
-  const [removed] = tasks.splice(index, 1);
+/* ────────────────────────────────── COMPLETE TASK ────────────────────── */
+function completeTask(username, id, callback) {
+  const oid = toObjectId(id);
+  if (!oid) return process.nextTick(() => callback(new Error("Invalid task ID")));
 
-  // ---- clearTimeout(): cancel any pending reminder for the deleted task ----
-  if (reminderTimers[removed.id]) {
-    clearTimeout(reminderTimers[removed.id]);
-    delete reminderTimers[removed.id];
-    console.log("Reminder Cancelled (task deleted)");
-  }
+  mongo.tasks().findOneAndUpdate(
+    { _id: oid },
+    { $set: { status: "Completed", completedAt: new Date() } },
+    { returnDocument: "after" },
+    (err, result) => {
+      if (err)    return callback(err);
+      if (!result) return callback(new Error("Task not found"));
 
-  taskEmitter.emit("taskDeleted", removed);
+      const task = result;
 
-  setImmediate(() => {
-    taskEmitter.emit("dashboardUpdated");
-  });
+      /* ── clearTimeout: task completed before reminder fired ── */
+      const key = oid.toString();
+      if (reminderTimers[key]) {
+        clearTimeout(reminderTimers[key]);
+        delete reminderTimers[key];
+        console.log(`  [clearTimeout] Reminder cancelled — task completed: "${task.title}"`);
+        addActivity(username, "reminderCancelled", `Reminder cancelled: "${task.title}"`);
+      }
 
-  callback(null, removed);
+      taskEmitter.emit("taskCompleted", username, task);
+
+      setImmediate(() => {
+        taskEmitter.emit("dashboardUpdated");
+      });
+
+      callback(null, task);
+    }
+  );
 }
 
-// ---------------- COMPLETE TASK ----------------
-function completeTask(id, callback) {
-  const task = tasks.find((t) => t.id === Number(id));
-  if (!task) {
-    return callback(new Error("Task not found"));
-  }
-  task.status = "Completed";
-  task.completedTime = new Date().toISOString();
+/* ────────────────────────────────── MARK PENDING ─────────────────────── */
+function markPending(username, id, callback) {
+  const oid = toObjectId(id);
+  if (!oid) return process.nextTick(() => callback(new Error("Invalid task ID")));
 
-  // ---- clearTimeout(): task completed before the reminder fired ----
-  if (reminderTimers[task.id]) {
-    clearTimeout(reminderTimers[task.id]);
-    delete reminderTimers[task.id];
-    console.log("Reminder Cancelled");
-    addActivity(`Reminder Cancelled - "${task.title}"`, "info");
-  }
+  mongo.tasks().findOneAndUpdate(
+    { _id: oid },
+    { $set: { status: "Pending", completedAt: null } },
+    { returnDocument: "after" },
+    (err, result) => {
+      if (err)    return callback(err);
+      if (!result) return callback(new Error("Task not found"));
 
-  taskEmitter.emit("taskCompleted", task);
+      taskEmitter.emit("taskUpdated", username, result);
 
-  setImmediate(() => {
-    taskEmitter.emit("dashboardUpdated");
-  });
+      setImmediate(() => {
+        taskEmitter.emit("dashboardUpdated");
+      });
 
-  callback(null, task);
+      callback(null, result);
+    }
+  );
 }
 
-// ---------------- MARK PENDING ----------------
-function markPending(id, callback) {
-  const task = tasks.find((t) => t.id === Number(id));
-  if (!task) return callback(new Error("Task not found"));
-  task.status = "Pending";
-  task.completedTime = null;
-  taskEmitter.emit("taskUpdated", task);
-  setImmediate(() => taskEmitter.emit("dashboardUpdated"));
-  callback(null, task);
-}
-
-// ---------------- SEARCH TASK ----------------
-function searchTask(keyword, callback) {
+/* ────────────────────────────────── SEARCH TASKS ─────────────────────── */
+function searchTasks(username, keyword, callback) {
   process.nextTick(() => {
-    const k = (keyword || "").toLowerCase();
-    const results = tasks.filter(
-      (t) => t.title.toLowerCase().includes(k) || t.description.toLowerCase().includes(k)
-    );
-    callback(null, results);
+    const regex = new RegExp(keyword, "i");
+    mongo.tasks()
+      .find({
+        userId: username,
+        $or: [{ title: regex }, { description: regex }]
+      })
+      .toArray(callback);
   });
 }
 
-// ---------------- FILTER TASK ----------------
-function filterTask(priority, callback) {
+/* ────────────────────────────────── FILTER TASKS ─────────────────────── */
+function filterTasks(username, priority, callback) {
   process.nextTick(() => {
-    if (!priority || priority === "All") return callback(null, tasks);
-    const results = tasks.filter((t) => t.priority === priority);
-    callback(null, results);
+    const filter = { userId: username };
+    if (priority && priority !== "All") filter.priority = priority;
+    mongo.tasks().find(filter).sort({ createdAt: -1 }).toArray(callback);
   });
+}
+
+/* ────────────────────────────────── DASHBOARD STATS ──────────────────── */
+function buildDashboardStats(username, callback) {
+  /* Run all countDocuments in parallel using a simple counter pattern */
+  const result = {};
+  let pending = 6;
+  let firstErr = null;
+
+  function done(err) {
+    if (err && !firstErr) firstErr = err;
+    if (--pending === 0) {
+      if (firstErr) return callback(firstErr);
+      const uptimeSeconds = Math.floor((Date.now() - stats.serverStartTime) / 1000);
+      callback(null, {
+        totalTasks:    result.total,
+        completed:     result.completed,
+        pending:       result.pending,
+        overdue:       result.overdue,
+        highPriority:  result.highPriority,
+        inProgress:    result.inProgress,
+        productivity:  result.total === 0 ? 0 : Math.round((result.completed / result.total) * 100),
+        todayDate:     new Date().toLocaleDateString(),
+        currentTime:   new Date().toLocaleTimeString(),
+        uptimeSeconds,
+        visitors:      stats.visitors,
+        loggedUsers:   [...stats.loggedUsers],
+        tasksCreated:  stats.tasksCreated,
+        tasksUpdated:  stats.tasksUpdated,
+        tasksCompleted:stats.tasksCompleted,
+        tasksDeleted:  stats.tasksDeleted,
+        remindersSent: stats.remindersSent,
+        dirty:         dashboardDirty
+      });
+    }
+  }
+
+  mongo.tasks().countDocuments({ userId: username },                                  (e, n) => { result.total       = n || 0; done(e); });
+  mongo.tasks().countDocuments({ userId: username, status: "Completed" },             (e, n) => { result.completed  = n || 0; done(e); });
+  mongo.tasks().countDocuments({ userId: username, status: "Pending" },               (e, n) => { result.pending    = n || 0; done(e); });
+  mongo.tasks().countDocuments({ userId: username, status: "Overdue" },               (e, n) => { result.overdue    = n || 0; done(e); });
+  mongo.tasks().countDocuments({ userId: username, priority: "High", status: { $ne: "Completed" } }, (e, n) => { result.highPriority = n || 0; done(e); });
+  mongo.tasks().countDocuments({ userId: username, status: "In Progress" },           (e, n) => { result.inProgress = n || 0; done(e); });
 }
 
 /* ============================================================================
-   6. TIMER-BASED BACKGROUND MONITORING
+   6. BACKGROUND MONITORING (setInterval / clearInterval)
 ============================================================================ */
 
-// ---- setInterval(): every 15 seconds check pending / overdue tasks ----
-const monitorInterval = setInterval(() => {
-  console.log("Checking Tasks...");
-  const now = new Date();
-  tasks.forEach((t) => {
-    if (t.status !== "Completed" && t.status !== "Overdue" && t.dueDate) {
-      if (new Date(t.dueDate) < now) {
-        t.status = "Overdue";
-        taskEmitter.emit("taskOverdue", t);
-      }
-    }
-  });
-}, 15000);
+let monitorInterval = null;
+let summaryInterval = null;
 
-// ---- setInterval(): every 60 seconds print a full session summary ----
-const summaryInterval = setInterval(() => {
-  printSessionSummary();
-}, 60000);
+function startBackgroundMonitors() {
+  /* ── Every 15 s: scan for tasks that have passed their dueDate ── */
+  monitorInterval = setInterval(() => {
+    console.log("\n[Monitor] Checking for overdue tasks...");
+    const now = new Date();
 
-function printSessionSummary() {
-  const uptimeSeconds = Math.floor((Date.now() - stats.serverStartTime) / 1000);
-  const pending = tasks.filter((t) => t.status === "Pending").length;
-  const completed = tasks.filter((t) => t.status === "Completed").length;
-  const overdue = tasks.filter((t) => t.status === "Overdue").length;
+    mongo.tasks()
+      .find({ status: { $in: ["Pending", "In Progress"] }, dueDate: { $lt: now, $ne: null } })
+      .toArray((err, overdueTasks) => {
+        if (err || !overdueTasks || overdueTasks.length === 0) return;
 
-  console.log("\n====================================");
-  console.log("SESSION SUMMARY");
-  console.log("====================================");
-  console.log(`Server Uptime     : ${uptimeSeconds}s`);
-  console.log(`Visitors          : ${stats.visitors}`);
-  console.log(`Logged Users      : ${[...stats.loggedUsers].join(", ") || "none"}`);
-  console.log(`Tasks Created     : ${stats.tasksCreated}`);
-  console.log(`Tasks Updated     : ${stats.tasksUpdated}`);
-  console.log(`Tasks Completed   : ${stats.tasksCompleted}`);
-  console.log(`Tasks Deleted     : ${stats.tasksDeleted}`);
-  console.log(`Pending Tasks     : ${pending}`);
-  console.log(`Completed Tasks   : ${completed}`);
-  console.log(`Overdue Tasks     : ${overdue}`);
-  console.log(`Reminders Sent    : ${stats.remindersSent}`);
-  console.log("====================================\n");
+        const ids = overdueTasks.map((t) => t._id);
+        mongo.tasks().updateMany(
+          { _id: { $in: ids } },
+          { $set: { status: "Overdue" } },
+          (updateErr) => {
+            if (updateErr) return console.error("[Monitor]", updateErr.message);
+            overdueTasks.forEach((t) => taskEmitter.emit("taskOverdue", t));
+          }
+        );
+      });
+  }, config.OVERDUE_CHECK_INTERVAL_MS);
+
+  /* ── Every 60 s: print a session summary to the console ── */
+  summaryInterval = setInterval(() => {
+    const uptimeSeconds = Math.floor((Date.now() - stats.serverStartTime) / 1000);
+    console.log("\n====================================");
+    console.log("  SESSION SUMMARY");
+    console.log("====================================");
+    console.log(`  Server Uptime      : ${uptimeSeconds}s`);
+    console.log(`  Visitors           : ${stats.visitors}`);
+    console.log(`  Logged Users       : [${[...stats.loggedUsers].join(", ") || "none"}]`);
+    console.log(`  Tasks Created      : ${stats.tasksCreated}`);
+    console.log(`  Tasks Updated      : ${stats.tasksUpdated}`);
+    console.log(`  Tasks Completed    : ${stats.tasksCompleted}`);
+    console.log(`  Tasks Deleted      : ${stats.tasksDeleted}`);
+    console.log(`  Reminders Sent     : ${stats.remindersSent}`);
+    console.log("====================================\n");
+  }, config.SUMMARY_INTERVAL_MS);
 }
 
 /* ============================================================================
-   7. STATIC FILE SERVING (manual - no Express)
+   7. STATIC FILE SERVING (manual — no Express)
 ============================================================================ */
 
 const MIME_TYPES = {
-  ".html": "text/html",
-  ".css": "text/css",
-  ".js": "text/javascript",
-  ".json": "application/json",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".gif": "image/gif",
-  ".svg": "image/svg+xml",
-  ".ico": "image/x-icon"
+  ".html":  "text/html",
+  ".css":   "text/css",
+  ".js":    "text/javascript",
+  ".json":  "application/json",
+  ".png":   "image/png",
+  ".jpg":   "image/jpeg",
+  ".jpeg":  "image/jpeg",
+  ".gif":   "image/gif",
+  ".svg":   "image/svg+xml",
+  ".ico":   "image/x-icon",
+  ".woff":  "font/woff",
+  ".woff2": "font/woff2"
 };
 
 function serveStaticFile(filePath, res) {
-  const ext = path.extname(filePath).toLowerCase();
+  const ext         = path.extname(filePath).toLowerCase();
   const contentType = MIME_TYPES[ext] || "application/octet-stream";
 
   fs.readFile(filePath, (err, data) => {
     if (err) {
       res.writeHead(404, { "Content-Type": "text/plain" });
-      res.end("404 - File Not Found");
+      res.end("404 — File not found");
       return;
     }
     res.writeHead(200, { "Content-Type": contentType });
@@ -468,80 +609,65 @@ function serveStaticFile(filePath, res) {
 }
 
 /* ============================================================================
-   8. HELPERS FOR THE API LAYER
+   8. API HELPERS
 ============================================================================ */
 
 function sendJSON(res, statusCode, payload) {
   const body = JSON.stringify(payload);
-  res.writeHead(statusCode, { "Content-Type": "application/json" });
+  res.writeHead(statusCode, {
+    "Content-Type":                "application/json",
+    "Access-Control-Allow-Origin": "*"
+  });
   res.end(body);
 }
 
 function readRequestBody(req, callback) {
   let body = "";
-  req.on("data", (chunk) => (body += chunk));
+  req.on("data", (chunk) => { body += chunk; });
   req.on("end", () => {
     if (!body) return callback(null, {});
     try {
-      const parsed = JSON.parse(body);
-      callback(null, parsed);
-    } catch (err) {
-      callback(new Error("Invalid JSON body"));g
+      callback(null, JSON.parse(body));
+    } catch (_) {
+      callback(new Error("Invalid JSON body"));
     }
   });
 }
 
 function getAuthUsername(req) {
   const authHeader = req.headers["authorization"] || "";
-  const token = authHeader.replace("Bearer ", "").trim();
+  const token      = authHeader.replace("Bearer ", "").trim();
   return sessions[token] || null;
 }
 
-function buildDashboardStats() {
-  const total = tasks.length;
-  const completed = tasks.filter((t) => t.status === "Completed").length;
-  const pending = tasks.filter((t) => t.status === "Pending").length;
-  const overdue = tasks.filter((t) => t.status === "Overdue").length;
-  const highPriority = tasks.filter((t) => t.priority === "High" && t.status !== "Completed").length;
-  const uptimeSeconds = Math.floor((Date.now() - stats.serverStartTime) / 1000);
-  const now = new Date();
-
-  return {
-    totalTasks: total,
-    completed,
-    pending,
-    overdue,
-    highPriority,
-    productivity: total === 0 ? 0 : Math.round((completed / total) * 100),
-    todayDate: now.toLocaleDateString(),
-    currentTime: now.toLocaleTimeString(),
-    uptimeSeconds,
-    visitors: stats.visitors,
-    loggedUsers: [...stats.loggedUsers],
-    tasksCreated: stats.tasksCreated,
-    tasksUpdated: stats.tasksUpdated,
-    tasksCompleted: stats.tasksCompleted,
-    tasksDeleted: stats.tasksDeleted,
-    remindersSent: stats.remindersSent,
-    dirty: dashboardDirty
-  };
-}
-
 /* ============================================================================
-   9. HTTP SERVER + MANUAL ROUTING
+   9. HTTP SERVER — MANUAL ROUTING  (http.createServer — no Express)
 ============================================================================ */
 
 const server = http.createServer((req, res) => {
   const parsedUrl = url.parse(req.url, true);
-  const pathname = parsedUrl.pathname;
-  const query = parsedUrl.query;
-  const method = req.method;
+  const pathname  = parsedUrl.pathname;
+  const query     = parsedUrl.query;
+  const method    = req.method;
 
-  /* ---------------- STATIC ROUTES ---------------- */
+  /* ──────────────── CORS preflight ──────────────── */
+  if (method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin":  "*",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization"
+    });
+    return res.end();
+  }
+
+  /* ──────────────── STATIC ROUTES ──────────────── */
   if (method === "GET" && (pathname === "/" || pathname === "/index.html")) {
     return serveStaticFile(path.join(__dirname, "public", "index.html"), res);
   }
-  if (method === "GET" && pathname === "/dashboard.html") {
+  if (method === "GET" && (pathname === "/login" || pathname === "/login.html")) {
+    return serveStaticFile(path.join(__dirname, "public", "index.html"), res);
+  }
+  if (method === "GET" && (pathname === "/dashboard" || pathname === "/dashboard.html")) {
     return serveStaticFile(path.join(__dirname, "public", "dashboard.html"), res);
   }
   if (method === "GET" && pathname.startsWith("/css/")) {
@@ -557,7 +683,7 @@ const server = http.createServer((req, res) => {
     return serveStaticFile(path.join(__dirname, pathname), res);
   }
 
-  /* ---------------- API: LOGIN ---------------- */
+  /* ──────────────── POST /api/login ──────────────── */
   if (method === "POST" && pathname === "/api/login") {
     return readRequestBody(req, (err, body) => {
       if (err) return sendJSON(res, 400, { success: false, message: err.message });
@@ -568,149 +694,218 @@ const server = http.createServer((req, res) => {
     });
   }
 
-  /* ---------------- API: LOGOUT ---------------- */
+  /* ──────────────── POST /api/register ──────────────── */
+  if (method === "POST" && pathname === "/api/register") {
+    return readRequestBody(req, (err, body) => {
+      if (err) return sendJSON(res, 400, { success: false, message: err.message });
+      registerUser(body.username, body.password, (error, result) => {
+        if (error) return sendJSON(res, 400, { success: false, message: error.message });
+        sendJSON(res, 201, { success: true, ...result });
+      });
+    });
+  }
+
+  /* ──────────────── POST /api/logout ──────────────── */
   if (method === "POST" && pathname === "/api/logout") {
     const authHeader = req.headers["authorization"] || "";
-    const token = authHeader.replace("Bearer ", "").trim();
+    const token      = authHeader.replace("Bearer ", "").trim();
     return logoutUser(token, (error, result) => {
       if (error) return sendJSON(res, 400, { success: false, message: error.message });
       sendJSON(res, 200, { success: true, ...result });
     });
   }
 
-  /* ---------------- Everything below requires login ---------------- */
-  const protectedApiPrefixes = ["/api/tasks", "/api/dashboard", "/api/activity", "/api/notifications"];
-  if (protectedApiPrefixes.some((p) => pathname.startsWith(p))) {
+  /* ──────────────── Protected routes (must be logged in) ──────────────── */
+  const protectedPrefixes = ["/api/tasks", "/api/dashboard", "/api/activity", "/api/notifications"];
+  if (protectedPrefixes.some((p) => pathname.startsWith(p))) {
     const username = getAuthUsername(req);
     if (!username) {
       return sendJSON(res, 401, { success: false, message: "Not authenticated" });
     }
-  }
 
-  /* ---------------- API: GET TASKS (list / search / filter / sort) ---------------- */
-  if (method === "GET" && pathname === "/api/tasks") {
-    const { search, priority, status, sort } = query;
+    /* ════════ GET /api/tasks ════════ */
+    if (method === "GET" && pathname === "/api/tasks") {
+      const { search, priority, status, sort } = query;
 
-    const finish = (list) => {
-      let result = list;
-      if (status && status !== "All") {
-        result = result.filter((t) => t.status === status);
-      }
-      if (sort === "priority") {
+      const finish = (err, list) => {
+        if (err) return sendJSON(res, 500, { success: false, message: err.message });
+
+        let result = list;
+
+        /* status filter (client-side — already MongoDB-filtered on priority/search) */
+        if (status && status !== "All") {
+          result = result.filter((t) => t.status === status);
+        }
+
+        /* sort */
         const order = { High: 0, Medium: 1, Low: 2 };
-        result = [...result].sort((a, b) => order[a.priority] - order[b.priority]);
-      } else if (sort === "dueDate") {
-        result = [...result].sort((a, b) => new Date(a.dueDate || 0) - new Date(b.dueDate || 0));
-      } else if (sort === "newest") {
-        result = [...result].sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
-      }
-      sendJSON(res, 200, { success: true, tasks: result });
-    };
+        if (sort === "priority") {
+          result = [...result].sort((a, b) => (order[a.priority] || 1) - (order[b.priority] || 1));
+        } else if (sort === "dueDate") {
+          result = [...result].sort((a, b) => new Date(a.dueDate || 0) - new Date(b.dueDate || 0));
+        } else {
+          result = [...result].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+        }
 
-    if (search) {
-      return searchTask(search, (err, results) => finish(results));
-    }
-    if (priority) {
-      return filterTask(priority, (err, results) => finish(results));
-    }
-    return finish(tasks);
-  }
+        /* Stringify ObjectId for the frontend */
+        const serialised = result.map((t) => ({
+          ...t,
+          _id:    t._id.toString(),
+          userId: t.userId
+        }));
 
-  /* ---------------- API: ADD TASK ---------------- */
-  if (method === "POST" && pathname === "/api/tasks") {
-    return readRequestBody(req, (err, body) => {
-      if (err) return sendJSON(res, 400, { success: false, message: err.message });
-      addTask(body, (error, task) => {
-        if (error) return sendJSON(res, 400, { success: false, message: error.message });
-        sendJSON(res, 201, { success: true, task });
+        sendJSON(res, 200, { success: true, tasks: serialised });
+      };
+
+      if (search) return searchTasks(username, search, finish);
+      return filterTasks(username, priority || "All", finish);
+    }
+
+    /* ════════ POST /api/tasks ════════ */
+    if (method === "POST" && pathname === "/api/tasks") {
+      return readRequestBody(req, (err, body) => {
+        if (err) return sendJSON(res, 400, { success: false, message: err.message });
+        addTask(username, body, (error, task) => {
+          if (error) return sendJSON(res, 400, { success: false, message: error.message });
+          sendJSON(res, 201, { success: true, task: { ...task, _id: task._id.toString() } });
+        });
       });
-    });
-  }
+    }
 
-  /* ---------------- API: UPDATE TASK  (PUT /api/tasks/:id) ---------------- */
-  const updateMatch = pathname.match(/^\/api\/tasks\/(\d+)$/);
-  if (method === "PUT" && updateMatch) {
-    const id = updateMatch[1];
-    return readRequestBody(req, (err, body) => {
-      if (err) return sendJSON(res, 400, { success: false, message: err.message });
-      updateTask(id, body, (error, task) => {
+    /* ════════ PUT /api/tasks/:id ════════ */
+    const updateMatch = pathname.match(/^\/api\/tasks\/([a-f\d]{24})$/i);
+    if (method === "PUT" && updateMatch) {
+      const id = updateMatch[1];
+      return readRequestBody(req, (err, body) => {
+        if (err) return sendJSON(res, 400, { success: false, message: err.message });
+        updateTask(username, id, body, (error, task) => {
+          if (error) return sendJSON(res, 404, { success: false, message: error.message });
+          sendJSON(res, 200, { success: true, task: { ...task, _id: task._id.toString() } });
+        });
+      });
+    }
+
+    /* ════════ DELETE /api/tasks/:id ════════ */
+    if (method === "DELETE" && updateMatch) {
+      const id = updateMatch[1];
+      return deleteTask(username, id, (error, task) => {
         if (error) return sendJSON(res, 404, { success: false, message: error.message });
-        sendJSON(res, 200, { success: true, task });
+        sendJSON(res, 200, { success: true, task: { ...task, _id: task._id.toString() } });
       });
-    });
+    }
+
+    /* ════════ POST /api/tasks/:id/complete ════════ */
+    const completeMatch = pathname.match(/^\/api\/tasks\/([a-f\d]{24})\/complete$/i);
+    if (method === "POST" && completeMatch) {
+      return completeTask(username, completeMatch[1], (error, task) => {
+        if (error) return sendJSON(res, 404, { success: false, message: error.message });
+        sendJSON(res, 200, { success: true, task: { ...task, _id: task._id.toString() } });
+      });
+    }
+
+    /* ════════ POST /api/tasks/:id/pending ════════ */
+    const pendingMatch = pathname.match(/^\/api\/tasks\/([a-f\d]{24})\/pending$/i);
+    if (method === "POST" && pendingMatch) {
+      return markPending(username, pendingMatch[1], (error, task) => {
+        if (error) return sendJSON(res, 404, { success: false, message: error.message });
+        sendJSON(res, 200, { success: true, task: { ...task, _id: task._id.toString() } });
+      });
+    }
+
+    /* ════════ GET /api/dashboard ════════ */
+    if (method === "GET" && pathname === "/api/dashboard") {
+      dashboardDirty = false;
+      return buildDashboardStats(username, (error, statsData) => {
+        if (error) return sendJSON(res, 500, { success: false, message: error.message });
+        sendJSON(res, 200, { success: true, stats: statsData });
+      });
+    }
+
+    /* ════════ GET /api/activity ════════ */
+    if (method === "GET" && pathname === "/api/activity") {
+      return mongo.activityLogs()
+        .find({})
+        .sort({ timestamp: -1 })
+        .limit(50)
+        .toArray((err, logs) => {
+          if (err) return sendJSON(res, 500, { success: false, message: err.message });
+          sendJSON(res, 200, {
+            success: true,
+            activity: logs.map((a) => ({
+              ...a,
+              _id:  a._id.toString(),
+              time: new Date(a.timestamp).toLocaleTimeString()
+            }))
+          });
+        });
+    }
+
+    /* ════════ GET /api/notifications (polling) ════════ */
+    if (method === "GET" && pathname === "/api/notifications") {
+      const since = Number(query.since) || 0;
+      const fresh = notifications.filter((n) => n.id > since);
+      return sendJSON(res, 200, { success: true, notifications: fresh });
+    }
   }
 
-  /* ---------------- API: DELETE TASK ---------------- */
-  if (method === "DELETE" && updateMatch) {
-    const id = updateMatch[1];
-    return deleteTask(id, (error, task) => {
-      if (error) return sendJSON(res, 404, { success: false, message: error.message });
-      sendJSON(res, 200, { success: true, task });
-    });
-  }
-
-  /* ---------------- API: COMPLETE TASK ---------------- */
-  const completeMatch = pathname.match(/^\/api\/tasks\/(\d+)\/complete$/);
-  if (method === "POST" && completeMatch) {
-    return completeTask(completeMatch[1], (error, task) => {
-      if (error) return sendJSON(res, 404, { success: false, message: error.message });
-      sendJSON(res, 200, { success: true, task });
-    });
-  }
-
-  /* ---------------- API: MARK PENDING ---------------- */
-  const pendingMatch = pathname.match(/^\/api\/tasks\/(\d+)\/pending$/);
-  if (method === "POST" && pendingMatch) {
-    return markPending(pendingMatch[1], (error, task) => {
-      if (error) return sendJSON(res, 404, { success: false, message: error.message });
-      sendJSON(res, 200, { success: true, task });
-    });
-  }
-
-  /* ---------------- API: DASHBOARD STATS ---------------- */
-  if (method === "GET" && pathname === "/api/dashboard") {
-    dashboardDirty = false;
-    return sendJSON(res, 200, { success: true, stats: buildDashboardStats() });
-  }
-
-  /* ---------------- API: ACTIVITY TIMELINE ---------------- */
-  if (method === "GET" && pathname === "/api/activity") {
-    return sendJSON(res, 200, { success: true, activity: activityLogs.slice(-50).reverse() });
-  }
-
-  /* ---------------- API: NOTIFICATIONS (polling) ---------------- */
-  if (method === "GET" && pathname === "/api/notifications") {
-    const since = Number(query.since) || 0;
-    const fresh = notifications.filter((n) => n.id > since);
-    return sendJSON(res, 200, { success: true, notifications: fresh });
-  }
-
-  /* ---------------- 404 fallback ---------------- */
+  /* ──────────────── 404 fallback ──────────────── */
   sendJSON(res, 404, { success: false, message: "Route not found" });
 });
 
 /* ============================================================================
-   10. SERVER STARTUP
+   10. SERVER STARTUP — wrapped inside mongo.connect() callback
+       Guarantees the DB is ready before any request is accepted.
 ============================================================================ */
 
-const PORT = process.env.PORT || 3000;
+mongo.connect((connectErr) => {
+  if (connectErr) {
+    console.error("\n❌  MongoDB connection failed:", connectErr.message);
+    console.error("    Make sure mongod is running on", config.mongoURI);
+    process.exit(1);
+  }
 
-server.listen(PORT, () => {
-  printSection("SERVER STARTED", [
-    `Port : ${PORT}`,
-    `URL  : http://localhost:${PORT}`,
-    `Time : ${new Date().toLocaleString()}`
-  ]);
+  /* Create indexes + seed demo users, then start listening */
+  mongo.ensureIndexes((idxErr) => {
+    if (idxErr) console.warn("[MongoDB] Index creation warning:", idxErr.message);
+
+    mongo.seedUsers((seedErr) => {
+      if (seedErr) console.warn("[MongoDB] Seed warning:", seedErr.message);
+
+      server.listen(config.PORT, () => {
+        printSection("SERVER STARTED", [
+          `Port      : ${config.PORT}`,
+          `URL       : http://localhost:${config.PORT}`,
+          `Database  : ${config.mongoURI}`,
+          `Time      : ${new Date().toLocaleString()}`,
+          "",
+          "Demo accounts: karthik / 1234  •  admin / admin"
+        ]);
+
+        /* Start background tasks only after server starts and DB is connected */
+        startBackgroundMonitors();
+      });
+    });
+  });
 });
 
 /* ============================================================================
-   11. GRACEFUL SHUTDOWN  -  clearInterval() demonstration
+   11. GRACEFUL SHUTDOWN — clearInterval() demonstration
 ============================================================================ */
 
 process.on("SIGINT", () => {
-  console.log("\nStopping background monitoring...");
-  clearInterval(monitorInterval); // stop the 15s pending/overdue check
-  clearInterval(summaryInterval); // stop the 60s session summary
-  printSection("SERVER STOPPED", ["Goodbye!"]);
-  server.close(() => process.exit(0));
+  console.log("\n[SIGINT] Stopping background monitoring...");
+  clearInterval(monitorInterval);  // stop the 15 s overdue check
+  clearInterval(summaryInterval);  // stop the 60 s session summary
+
+  /* Cancel all pending reminder timers */
+  Object.keys(reminderTimers).forEach((key) => {
+    clearTimeout(reminderTimers[key]);
+    delete reminderTimers[key];
+  });
+
+  printSection("SERVER STOPPED", ["All intervals cleared. Goodbye! 👋"]);
+
+  mongo.disconnect(() => {
+    server.close(() => process.exit(0));
+  });
 });

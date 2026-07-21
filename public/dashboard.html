@@ -1,10 +1,11 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Dashboard | Smart TO-DO Manager</title>
-<link rel="stylesheet" href="/css/style.css" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Smart TO-DO Manager Dashboard — manage your tasks, view activity, and track productivity." />
+  <title>Dashboard | Smart TO-DO Manager</title>
+  <link rel="stylesheet" href="/css/style.css" />
 </head>
 <body>
 
@@ -15,11 +16,11 @@
     <div class="brand">✅ TO-DO Manager</div>
 
     <div class="nav-item active" data-section="dashboard">📊 Dashboard</div>
-    <div class="nav-item" data-section="tasks">🗂️ Tasks</div>
-    <div class="nav-item" data-section="activity">📜 Activity</div>
-    <div class="nav-item" id="logoutBtn">🚪 Logout</div>
+    <div class="nav-item"        data-section="tasks">🗂️ Tasks</div>
+    <div class="nav-item"        data-section="activity">📜 Activity</div>
+    <div class="nav-item"        id="logoutBtn">🚪 Logout</div>
 
-    <div class="clock-box glass">
+    <div class="clock-box">
       <div class="time" id="liveClock">00:00:00</div>
       <div class="date" id="liveDate">--</div>
     </div>
@@ -28,6 +29,7 @@
   <!-- ===================== MAIN CONTENT ===================== -->
   <main class="main-content">
 
+    <!-- Top bar -->
     <div class="topbar">
       <div>
         <h2 id="welcomeTitle">Welcome!</h2>
@@ -36,7 +38,7 @@
       <button class="btn small" id="openAddTaskBtn">＋ Add Task</button>
     </div>
 
-    <!-- ---------------- STAT CARDS ---------------- -->
+    <!-- ─── STAT CARDS ─── -->
     <div class="stats-grid">
       <div class="stat-card glass">
         <div class="label">Total Tasks</div>
@@ -48,7 +50,7 @@
       </div>
       <div class="stat-card glass">
         <div class="label">Pending</div>
-        <div class="value" id="statPending">0</div>
+        <div class="value pending" id="statPending">0</div>
       </div>
       <div class="stat-card glass">
         <div class="label">Overdue</div>
@@ -60,10 +62,10 @@
       </div>
     </div>
 
-    <!-- ---------------- PROGRESS BAR ---------------- -->
+    <!-- ─── PRODUCTIVITY BAR ─── -->
     <div class="progress-wrap glass">
       <div class="top-row">
-        <span>Productivity</span>
+        <span>Productivity Score</span>
         <span id="productivityLabel">0%</span>
       </div>
       <div class="progress-track">
@@ -71,23 +73,26 @@
       </div>
     </div>
 
+    <!-- ─── TWO-COLUMN GRID ─── -->
     <div class="content-grid">
-      <!-- ---------------- TASKS PANEL ---------------- -->
+
+      <!-- Tasks panel -->
       <div>
         <div class="panel glass">
           <div class="panel-header">
             <h3>My Tasks</h3>
+            <span class="text-muted" id="taskCount" style="font-size:13px;"></span>
           </div>
 
           <div class="controls-row">
             <div class="search-box">
-              <input type="text" id="searchInput" placeholder="Quick search tasks... (Ctrl+K)" />
+              <input type="text" id="searchInput" placeholder="Quick search… (Ctrl+K)" />
             </div>
             <select id="priorityFilter">
               <option value="All">All Priorities</option>
-              <option value="High">High</option>
-              <option value="Medium">Medium</option>
-              <option value="Low">Low</option>
+              <option value="High">🔴 High</option>
+              <option value="Medium">🟡 Medium</option>
+              <option value="Low">🟢 Low</option>
             </select>
             <select id="statusFilter">
               <option value="All">All Status</option>
@@ -106,11 +111,15 @@
             <div class="loader"></div>
           </div>
 
-          <div class="kbd-hint">Shortcuts: <kbd>Ctrl</kbd>+<kbd>K</kbd> search &nbsp; <kbd>Ctrl</kbd>+<kbd>N</kbd> new task</div>
+          <div class="kbd-hint">
+            Shortcuts: <kbd>Ctrl</kbd>+<kbd>K</kbd> search &nbsp;
+            <kbd>Ctrl</kbd>+<kbd>N</kbd> new task &nbsp;
+            <kbd>Esc</kbd> close modal
+          </div>
         </div>
       </div>
 
-      <!-- ---------------- SIDE PANEL: ACTIVITY + NOTIFICATIONS ---------------- -->
+      <!-- Activity timeline panel -->
       <div>
         <div class="panel glass">
           <div class="panel-header"><h3>Activity Timeline</h3></div>
@@ -119,40 +128,46 @@
           </div>
         </div>
       </div>
-    </div>
+
+    </div><!-- /content-grid -->
 
   </main>
 </div>
 
-<!-- ===================== ADD / EDIT TASK MODAL ===================== -->
+<!-- ============= ADD / EDIT TASK MODAL ============= -->
 <div class="modal-overlay" id="taskModal">
   <div class="modal-box glass">
     <h3 id="modalTitle">Add New Task</h3>
     <form id="taskForm">
       <input type="hidden" id="taskId" />
+
       <div class="form-row">
-        <label>Task Title</label>
-        <input type="text" id="taskTitle" placeholder="e.g. Java Assignment" required />
+        <label for="taskTitle">Task Title *</label>
+        <input type="text" id="taskTitle" placeholder="e.g. Complete Java Assignment" required />
       </div>
+
       <div class="form-row">
-        <label>Description</label>
-        <textarea id="taskDescription" placeholder="Add details..."></textarea>
+        <label for="taskDescription">Description</label>
+        <textarea id="taskDescription" placeholder="Add notes or details…"></textarea>
       </div>
+
       <div class="form-row">
-        <label>Priority</label>
+        <label for="taskPriority">Priority</label>
         <select id="taskPriority">
-          <option value="High">High</option>
-          <option value="Medium" selected>Medium</option>
-          <option value="Low">Low</option>
+          <option value="High">🔴 High</option>
+          <option value="Medium" selected>🟡 Medium</option>
+          <option value="Low">🟢 Low</option>
         </select>
       </div>
+
       <div class="form-row">
-        <label>Due Date</label>
+        <label for="taskDueDate">Due Date</label>
         <input type="datetime-local" id="taskDueDate" />
       </div>
+
       <div class="modal-actions">
         <button type="button" class="btn secondary" id="cancelModalBtn">Cancel</button>
-        <button type="submit" class="btn" id="saveTaskBtn">Save Task</button>
+        <button type="submit" class="btn"            id="saveTaskBtn">Save Task</button>
       </div>
     </form>
   </div>

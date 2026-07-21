@@ -1,43 +1,71 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Smart TO-DO Manager | Login</title>
-<link rel="stylesheet" href="/css/style.css" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Smart Event-Driven TO-DO Manager — Login or create an account to manage your tasks with MongoDB persistence." />
+  <title>Smart TO-DO Manager | Login</title>
+  <link rel="stylesheet" href="/css/style.css" />
 </head>
 <body>
 
   <div class="login-wrapper">
     <div class="login-card glass">
-      <h1>Smart TO-DO Manager</h1>
-      <p class="subtitle">Event-Driven Task Management • Node.js Core Only</p>
 
+      <!-- Brand -->
+      <span class="login-logo">✅</span>
+      <h1>Smart TO-DO Manager</h1>
+      <p class="subtitle">Event-Driven · MongoDB · Node.js Core Only</p>
+
+      <!-- Tab switcher -->
+      <div class="auth-tabs">
+        <button class="auth-tab active" id="tabLogin"    type="button">Login</button>
+        <button class="auth-tab"        id="tabRegister" type="button">Register</button>
+      </div>
+
+      <!-- Error / success message -->
       <div class="error-msg" id="errorMsg"></div>
 
+      <!-- ─────────── LOGIN FORM ─────────── -->
       <form id="loginForm">
         <div class="input-group">
-          <label for="username">Username</label>
-          <input type="text" id="username" placeholder="Enter username" autocomplete="username" />
+          <label for="loginUsername">Username</label>
+          <input type="text"     id="loginUsername" placeholder="Enter username"  autocomplete="username"         />
         </div>
-
         <div class="input-group">
-          <label for="password">Password</label>
-          <input type="password" id="password" placeholder="Enter password" autocomplete="current-password" />
+          <label for="loginPassword">Password</label>
+          <input type="password" id="loginPassword" placeholder="Enter password"  autocomplete="current-password" />
         </div>
-
         <div class="remember-row">
           <input type="checkbox" id="rememberMe" checked />
           <label for="rememberMe">Remember me for this session</label>
         </div>
-
         <button type="submit" class="btn" id="loginBtn">Login</button>
       </form>
 
-      <div class="demo-users">
+      <!-- ─────────── REGISTER FORM ─────────── -->
+      <form id="registerForm" class="hidden">
+        <div class="input-group">
+          <label for="regUsername">Username <span style="color:var(--text-muted);font-weight:400">(min 3 chars)</span></label>
+          <input type="text"     id="regUsername" placeholder="Choose a username" autocomplete="username"     />
+        </div>
+        <div class="input-group">
+          <label for="regPassword">Password <span style="color:var(--text-muted);font-weight:400">(min 4 chars)</span></label>
+          <input type="password" id="regPassword" placeholder="Choose a password" autocomplete="new-password" />
+        </div>
+        <div class="input-group">
+          <label for="regConfirm">Confirm Password</label>
+          <input type="password" id="regConfirm"  placeholder="Repeat password"  autocomplete="new-password" />
+        </div>
+        <button type="submit" class="btn" id="registerBtn">Create Account</button>
+      </form>
+
+      <!-- Demo accounts hint (only visible on login tab) -->
+      <div class="demo-users" id="demoHint">
         Demo accounts:<br />
-        karthik / 1234 &nbsp;•&nbsp; admin / admin
+        <kbd>karthik</kbd> / <kbd>1234</kbd> &nbsp;•&nbsp; <kbd>admin</kbd> / <kbd>admin</kbd>
       </div>
+
     </div>
   </div>
 
